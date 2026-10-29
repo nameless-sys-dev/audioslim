@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AudioSlim-Specific Build Files
+tools/ffmpeg_build

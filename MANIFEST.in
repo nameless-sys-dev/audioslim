@@ -1,0 +1,5 @@
+include README.md
+recursive-include tools *.sh
+recursive-include tests *.py
+recursive-include src/audioslim/_bin *
+recursive-include src/audioslim/_licenses *

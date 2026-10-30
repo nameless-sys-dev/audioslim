@@ -1,5 +1,0 @@
-Supported file protocols:
-Input:
-  file
-Output:
-  file

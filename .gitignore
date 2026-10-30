@@ -220,4 +220,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # AudioSlim-Specific Build Files
-tools/ffmpeg_build
+.native

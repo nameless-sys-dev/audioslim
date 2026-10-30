@@ -1,0 +1,12 @@
+Formats:
+ D.. = Demuxing supported
+ .E. = Muxing supported
+ ..d = Is a device
+ ---
+  E  flac             
+  E  ipod             
+  E  mov              
+  E  mp3              
+  E  ogg              
+  E  opus             
+  E  wav              

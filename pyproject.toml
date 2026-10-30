@@ -1,21 +1,26 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=68", "wheel>=0.41"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "audioslim"
 version = "0.1.0"
-description = "A lightweight Python audio manipulation library with a custom bundled FFmpeg."
+description = "Small audio manipulation library with a bundled audio-only FFmpeg"
 readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "MIT"}
-authors = [
-    {name = "Alexander P. Scott", email = "apscott63@aol.com"}
-]
+requires-python = ">=3.10"
 dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
 
 [tool.setuptools.package-data]
-slim_audio = ["bin/*"]
+audioslim = [
+    "_bin/ffmpeg",
+    "_bin/ffmpeg.exe",
+    "_licenses/*",
+]

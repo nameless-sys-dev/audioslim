@@ -1,7 +1,4 @@
-# NOTICE ⚠
-I haven't been able to build and test this library because I just started developing it today, and FFmpeg's [website](https://www.ffmpeg.org/) is [currently down](https://downforeveryoneorjustme.com/ffmpeg.org). I will build and test it once FFmpeg is back up. This is as of 8:57 a.m. EST on October 29, 2026. - Alex
-
-# Audioslim
+# audioslim
 
 A file-based audio manipulation library using a bundled, allow-listed
 FFmpeg executable. Python 3.10+ is required. There are no runtime Python
@@ -49,9 +46,9 @@ Then run:
 
 ```sh
 bash tools/build_ffmpeg.sh \
-    /path/to/ffmpeg-release.tar.xz \
-    /path/to/lame-release.tar.gz \
-    /path/to/opus-release.tar.gz
+    ffmpeg-7.1.5.tar.xz \
+    lame-3.100.tar.gz \
+    opus-1.6.1.tar.gz
 
 python3 -m venv .venv
 . .venv/bin/activate

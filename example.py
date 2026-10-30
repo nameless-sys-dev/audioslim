@@ -4,7 +4,7 @@ import tempfile
 import wave
 from pathlib import Path
 
-from slim_audio import AudioTrack, get_ffmpeg_binary
+from audioslim import AudioTrack, get_ffmpeg_binary
 
 
 def create_test_sine_wav(filepath: Path, duration_sec: float = 5.0, freq: float = 440.0):

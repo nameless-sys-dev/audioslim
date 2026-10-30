@@ -1,371 +1,462 @@
 from __future__ import annotations
 
-import copy
+import math
 import os
-import platform
-import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Sequence, Union
+from typing import Iterable
 
-from .exceptions import (
-    BinaryNotFoundError,
-    FFmpegExecutionError,
-    AudioSlimError,
-    UnsupportedFormatError,
-)
 
-SupportedFormat = Literal["mp3", "wav", "m4a", "flac", "opus"]
-PathLike = Union[str, Path]
+PathLike = str | os.PathLike[str]
+
+
+class AudioError(RuntimeError):
+    """Bundled FFmpeg could not start or could not process the audio."""
+
+
+def _number(value: float, name: str, minimum: float | None = None) -> float:
+    value = float(value)
+
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+
+    return value
 
 
 @dataclass(frozen=True)
-class AudioMetadata:
-    duration: float
-    codec: str
-    sample_rate: int
-    channels: int
-    bitrate_kbps: Optional[int]
-
-
-def get_ffmpeg_binary() -> Path:
-    """Locates the bundled custom FFmpeg executable."""
-    exe_name = "ffmpeg.exe" if platform.system().lower() == "windows" else "ffmpeg"
-    bin_path = Path(__file__).parent / "bin" / exe_name
-
-    if not bin_path.is_file():
-        raise BinaryNotFoundError(
-            f"Bundled FFmpeg binary not found at '{bin_path}'. "
-            "Please run './build_ffmpeg.sh' before using audioslim."
-        )
-    if not os.access(bin_path, os.X_OK):
-        os.chmod(bin_path, 0o755)
-
-    return bin_path
-
-
-class AudioTrack:
+class ExportOptions:
     """
-    Represents an audio file and a lazy chain of manipulations.
-    All operations return a new AudioTrack instance and execute in a single pass upon .export().
+    Output settings.
+
+    codec:
+        Normally inferred from the destination extension.
+        Use "alac" for lossless M4A, or a PCM codec for WAV.
+
+    bitrate:
+        Bits per second, for MP3, AAC, or Opus only.
+
+    sample_rate/channels:
+        None leaves selection to FFmpeg and the encoder.
+        Explicit channel conversion supports mono or stereo.
+
+    overwrite:
+        False prevents replacing an existing destination.
+
+    timeout:
+        Maximum FFmpeg execution time in seconds; None means no limit.
     """
 
-    SUPPORTED_FORMATS = {"mp3", "wav", "m4a", "flac", "opus"}
+    codec: str | None = None
+    bitrate: int | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
+    overwrite: bool = False
+    timeout: float | None = None
 
-    def __init__(
-        self,
-        inputs: list[Path],
-        metadata: AudioMetadata,
-        filters: Optional[list[str]] = None,
-        is_concat: bool = False,
-        target_sample_rate: Optional[int] = None,
-        target_channels: Optional[int] = None,
-    ):
-        self._inputs = inputs
-        self._metadata = metadata
-        self._filters = filters or []
-        self._is_concat = is_concat
-        self._target_sample_rate = target_sample_rate
-        self._target_channels = target_channels
+    def __post_init__(self):
+        for name in ("bitrate", "sample_rate"):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not int or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
 
-    @classmethod
-    def from_file(cls, path: PathLike) -> AudioTrack:
-        """Loads an audio file and probes its metadata."""
-        file_path = Path(path).resolve()
-        if not file_path.is_file():
-            raise FileNotFoundError(f"Audio file not found: {file_path}")
+        if self.channels is not None and (
+            type(self.channels) is not int or self.channels not in (1, 2)
+        ):
+            raise ValueError("channels must be None, 1, or 2")
 
-        ext = file_path.suffix.lower().lstrip(".")
-        if ext not in cls.SUPPORTED_FORMATS:
-            raise UnsupportedFormatError(
-                f"Input extension '.{ext}' is not supported. Supported: {cls.SUPPORTED_FORMATS}"
+        if type(self.overwrite) is not bool:
+            raise ValueError("overwrite must be a boolean")
+
+        if self.timeout is not None:
+            timeout = _number(self.timeout, "timeout", 0)
+            if timeout == 0:
+                raise ValueError("timeout must be positive")
+            object.__setattr__(self, "timeout", timeout)
+
+
+_DEFAULT = ExportOptions()
+
+_PCM_CODECS = {
+    name: name
+    for name in (
+        "pcm_u8",
+        "pcm_s16le",
+        "pcm_s24le",
+        "pcm_s32le",
+        "pcm_f32le",
+        "pcm_f64le",
+    )
+}
+
+# extension -> (muxer, default public codec name, allowed encoder mappings)
+_FORMATS = {
+    ".mp3": ("mp3", "mp3", {"mp3": "libmp3lame"}),
+    ".wav": ("wav", "pcm_s16le", _PCM_CODECS),
+    ".m4a": ("ipod", "aac", {"aac": "aac", "alac": "alac"}),
+    ".flac": ("flac", "flac", {"flac": "flac"}),
+    ".opus": ("opus", "opus", {"opus": "libopus"}),
+}
+
+_DEFAULT_BITRATES = {
+    "mp3": 192_000,
+    "aac": 192_000,
+    "opus": 128_000,
+}
+
+
+def ffmpeg_path() -> Path:
+    """Return the bundled executable, without searching PATH."""
+    name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    binary = Path(__file__).resolve().parent / "_bin" / name
+
+    if not binary.is_file():
+        raise AudioError(
+            "Bundled FFmpeg is missing. Run tools/build_ffmpeg.sh "
+            "before installing or building the package."
+        )
+
+    if os.name != "nt" and not os.access(binary, os.X_OK):
+        raise AudioError(f"Bundled FFmpeg is not executable: {binary}")
+
+    return binary
+
+
+def _encoding_args(destination: Path, options: ExportOptions) -> list[str]:
+    extension = destination.suffix.lower()
+
+    if extension not in _FORMATS:
+        raise ValueError(
+            f"Unsupported output extension {extension!r}; "
+            f"choose one of {', '.join(_FORMATS)}"
+        )
+
+    muxer, default_codec, encoders = _FORMATS[extension]
+    codec = default_codec if options.codec is None else options.codec
+
+    if codec not in encoders:
+        raise ValueError(
+            f"Codec {codec!r} is not supported for {extension}; "
+            f"choose one of {', '.join(encoders)}"
+        )
+
+    args = ["-c:a", encoders[codec]]
+
+    if codec in _DEFAULT_BITRATES:
+        bitrate = options.bitrate or _DEFAULT_BITRATES[codec]
+        args += ["-b:a", str(bitrate)]
+    elif options.bitrate is not None:
+        raise ValueError("bitrate applies only to MP3, AAC, and Opus")
+
+    if options.sample_rate is not None:
+        args += ["-ar", str(options.sample_rate)]
+
+    if options.channels is not None:
+        args += ["-ac", str(options.channels)]
+
+    if muxer == "ipod":
+        args += ["-movflags", "+faststart"]
+
+    # The temporary output does not have the destination's extension,
+    # so the muxer must always be explicit.
+    args += ["-f", muxer]
+    return args
+
+
+def _render(
+    sources: Iterable[PathLike],
+    destination: PathLike,
+    options: ExportOptions,
+    *,
+    audio_filter: str | None = None,
+    graph: str | None = None,
+) -> Path:
+    inputs = [
+        Path(source).expanduser().resolve(strict=True)
+        for source in sources
+    ]
+
+    if not inputs:
+        raise ValueError("At least one input is required")
+
+    for source in inputs:
+        if not source.is_file():
+            raise ValueError(f"Input is not a regular file: {source}")
+
+    # Do not resolve the final filename: replacing an output symlink
+    # should replace the link, rather than overwrite its target.
+    output = Path(destination).expanduser().absolute()
+    encoding_args = _encoding_args(output, options)
+
+    if not output.parent.is_dir():
+        raise FileNotFoundError(f"Output directory does not exist: {output.parent}")
+
+    if not options.overwrite and os.path.lexists(output):
+        raise FileExistsError(f"Destination already exists: {output}")
+
+    command = [
+        str(ffmpeg_path()),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",  # Only overwrites our private temporary file.
+    ]
+
+    for source in inputs:
+        command += ["-protocol_whitelist", "file", "-i", str(source)]
+
+    if graph is not None:
+        command += ["-filter_complex", graph, "-map", "[out]"]
+    else:
+        command += ["-map", "0:a:0"]
+        if audio_filter is not None:
+            command += ["-af", audio_filter]
+
+    command += [
+        "-vn",
+        "-sn",
+        "-dn",
+        "-map_metadata",
+        "-1",
+        "-map_metadata:s:a",
+        "-1",
+        "-map_chapters",
+        "-1",
+    ]
+    command += encoding_args
+
+    # Write beside the destination so publication stays on one filesystem.
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=".audioslim-",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+
+    try:
+        try:
+            result = subprocess.run(
+                command + [str(temporary)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=options.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AudioError("FFmpeg exceeded the configured timeout") from exc
+        except OSError as exc:
+            raise AudioError(
+                "Could not execute bundled FFmpeg. Check its architecture, "
+                "permissions, and operating-system runtime requirements."
+            ) from exc
+
+        if result.returncode != 0:
+            details = result.stderr[-8000:].strip()
+            raise AudioError(
+                f"FFmpeg exited with status {result.returncode}:\n{details}"
             )
 
-        metadata = cls._probe(file_path)
-        return cls(inputs=[file_path], metadata=metadata)
-
-    @classmethod
-    def concat(cls, tracks: Sequence[AudioTrack]) -> AudioTrack:
-        """
-        Concatenates multiple AudioTracks sequentially.
-        Note: Any existing filters on the individual tracks must be exported first
-        or applied after concatenation.
-        """
-        if len(tracks) < 2:
-            raise AudioSlimError("At least two AudioTracks are required for concatenation.")
-
-        inputs: list[Path] = []
-        total_duration = 0.0
-
-        for t in tracks:
-            if t._filters or t._is_concat:
-                raise AudioSlimError(
-                    "Cannot directly concatenate tracks with unrendered filters. "
-                    "Export intermediate tracks or apply manipulations after concat()."
-                )
-            inputs.extend(t._inputs)
-            total_duration += t.duration
-
-        base_meta = tracks[0].metadata
-        combined_meta = AudioMetadata(
-            duration=total_duration,
-            codec=base_meta.codec,
-            sample_rate=base_meta.sample_rate,
-            channels=base_meta.channels,
-            bitrate_kbps=base_meta.bitrate_kbps,
-        )
-        return cls(inputs=inputs, metadata=combined_meta, is_concat=True)
-
-    @staticmethod
-    def _probe(file_path: Path) -> AudioMetadata:
-        """Uses `ffmpeg -i` stderr output to extract metadata without requiring ffprobe."""
-        ffmpeg = get_ffmpeg_binary()
-        cmd = [str(ffmpeg), "-hide_banner", "-i", str(file_path)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        output = proc.stderr
-
-        # Parse Duration: 00:03:12.45
-        dur_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
-        if not dur_match:
-            raise FFmpegExecutionError("Failed to parse audio duration.", cmd, output)
-        hours, mins, secs = map(float, dur_match.groups())
-        duration = (hours * 3600.0) + (mins * 60.0) + secs
-
-        # Parse Audio Stream info: Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s
-        stream_match = re.search(
-            r"Stream #\d+:\d+.*?: Audio:\s*([a-zA-Z0-9_]+).*?,\s*(\d+)\s*Hz,\s*([^,]+)",
-            output,
-        )
-        if not stream_match:
-            raise FFmpegExecutionError("No valid audio stream found in file.", cmd, output)
-
-        codec = stream_match.group(1)
-        sample_rate = int(stream_match.group(2))
-        channel_str = stream_match.group(3).strip()
-
-        if channel_str in ("mono", "1 channels", "1.0"):
-            channels = 1
-        elif channel_str in ("stereo", "2 channels", "2.0"):
-            channels = 2
+        if options.overwrite:
+            os.replace(temporary, output)
         else:
-            ch_num = re.search(r"(\d+)", channel_str)
-            channels = int(ch_num.group(1)) if ch_num else 2
+            # Atomic no-clobber publication: also handles another process
+            # creating the destination while FFmpeg was running.
+            os.link(temporary, output)
 
-        # Parse Bitrate
-        br_match = re.search(r"bitrate:\s*(\d+)\s*kb/s", output)
-        bitrate_kbps = int(br_match.group(1)) if br_match else None
+        return output
+    finally:
+        temporary.unlink(missing_ok=True)
 
-        return AudioMetadata(
-            duration=duration,
-            codec=codec,
-            sample_rate=sample_rate,
-            channels=channels,
-            bitrate_kbps=bitrate_kbps,
+
+def convert(
+    source: PathLike,
+    destination: PathLike,
+    *,
+    options: ExportOptions = _DEFAULT,
+) -> Path:
+    """Decode and encode the first audio stream."""
+    return _render([source], destination, options)
+
+
+def trim(
+    source: PathLike,
+    destination: PathLike,
+    *,
+    start: float = 0,
+    duration: float | None = None,
+    options: ExportOptions = _DEFAULT,
+) -> Path:
+    """Trim by seconds; duration=None retains everything after start."""
+    start = _number(start, "start", 0)
+    settings = [f"start={start:.9f}"]
+
+    if duration is not None:
+        duration = _number(duration, "duration", 0)
+        if duration == 0:
+            raise ValueError("duration must be positive")
+        settings.append(f"duration={duration:.9f}")
+
+    audio_filter = (
+        "atrim=" + ":".join(settings) + ",asetpts=PTS-STARTPTS"
+    )
+    return _render(
+        [source], destination, options, audio_filter=audio_filter
+    )
+
+
+def gain(
+    source: PathLike,
+    destination: PathLike,
+    *,
+    db: float,
+    options: ExportOptions = _DEFAULT,
+) -> Path:
+    """Apply gain in decibels. Positive gain can cause clipping."""
+    db = _number(db, "db")
+    return _render(
+        [source],
+        destination,
+        options,
+        audio_filter=f"volume={db:.9f}dB",
+    )
+
+
+def fade(
+    source: PathLike,
+    destination: PathLike,
+    *,
+    fade_in: float = 0,
+    fade_out_start: float | None = None,
+    fade_out: float = 0,
+    options: ExportOptions = _DEFAULT,
+) -> Path:
+    """
+    Apply linear fades, with all times in seconds.
+
+    fade_out_start is explicit because this library does not bundle
+    FFprobe or perform a separate duration-probing pass.
+    """
+    fade_in = _number(fade_in, "fade_in", 0)
+    fade_out = _number(fade_out, "fade_out", 0)
+    filters = ["asetpts=PTS-STARTPTS"]
+
+    if fade_in > 0:
+        filters.append(f"afade=t=in:st=0:d={fade_in:.9f}")
+
+    if fade_out > 0:
+        if fade_out_start is None:
+            raise ValueError("fade_out_start is required for a fade-out")
+
+        start = _number(fade_out_start, "fade_out_start", 0)
+        filters.append(
+            f"afade=t=out:st={start:.9f}:d={fade_out:.9f}"
+        )
+    elif fade_out_start is not None:
+        raise ValueError("fade_out must be positive when fade_out_start is set")
+
+    return _render(
+        [source],
+        destination,
+        options,
+        audio_filter=",".join(filters),
+    )
+
+
+def _combine(
+    sources: Iterable[PathLike],
+    destination: PathLike,
+    options: ExportOptions,
+    *,
+    mixing: bool,
+    normalize: bool = True,
+) -> Path:
+    if isinstance(sources, (str, os.PathLike)):
+        raise TypeError("Pass an iterable of input paths, not one path")
+
+    sources = tuple(sources)
+    if not sources:
+        raise ValueError("At least one input is required")
+
+    # All inputs must have matching audio parameters before concat/amix.
+    rate = options.sample_rate or 48_000
+    channels = options.channels or 2
+    layout = "mono" if channels == 1 else "stereo"
+
+    chains = []
+    for index in range(len(sources)):
+        chains.append(
+            f"[{index}:a:0]"
+            f"aresample={rate},"
+            f"aformat=sample_fmts=fltp:"
+            f"sample_rates={rate}:channel_layouts={layout},"
+            f"asetpts=PTS-STARTPTS[a{index}]"
         )
 
-    def _clone(
-        self,
-        new_filter: Optional[str] = None,
-        new_duration: Optional[float] = None,
-        sample_rate: Optional[int] = None,
-        channels: Optional[int] = None,
-    ) -> AudioTrack:
-        """Creates a new AudioTrack instance with updated filter state."""
-        filters = copy.copy(self._filters)
-        if new_filter:
-            filters.append(new_filter)
+    labels = "".join(f"[a{index}]" for index in range(len(sources)))
 
-        meta = AudioMetadata(
-            duration=new_duration if new_duration is not None else self._metadata.duration,
-            codec=self._metadata.codec,
-            sample_rate=sample_rate or self._metadata.sample_rate,
-            channels=channels or self._metadata.channels,
-            bitrate_kbps=self._metadata.bitrate_kbps,
+    if mixing:
+        operation = (
+            f"amix=inputs={len(sources)}:"
+            f"duration=longest:dropout_transition=0:"
+            f"normalize={int(normalize)}"
         )
-        return AudioTrack(
-            inputs=copy.copy(self._inputs),
-            metadata=meta,
-            filters=filters,
-            is_concat=self._is_concat,
-            target_sample_rate=sample_rate or self._target_sample_rate,
-            target_channels=channels or self._target_channels,
-        )
+    else:
+        operation = f"concat=n={len(sources)}:v=0:a=1"
 
-    @property
-    def metadata(self) -> AudioMetadata:
-        return self._metadata
+    chains.append(f"{labels}{operation}[out]")
 
-    @property
-    def duration(self) -> float:
-        return self._metadata.duration
+    return _render(
+        sources,
+        destination,
+        options,
+        graph=";".join(chains),
+    )
 
-    # -------------------------------------------------------------------------
-    # Audio Manipulations
-    # -------------------------------------------------------------------------
 
-    def trim(self, start: float = 0.0, end: Optional[float] = None) -> AudioTrack:
-        """Trims the audio between `start` and `end` (in seconds)."""
-        if start < 0:
-            raise ValueError("start time cannot be negative.")
-        if end is not None and end <= start:
-            raise ValueError("end time must be greater than start time.")
+def concatenate(
+    sources: Iterable[PathLike],
+    destination: PathLike,
+    *,
+    options: ExportOptions = _DEFAULT,
+) -> Path:
+    """Join inputs end-to-end, using 48 kHz stereo unless overridden."""
+    return _combine(
+        sources, destination, options, mixing=False
+    )
 
-        actual_end = min(end, self.duration) if end is not None else self.duration
-        new_duration = max(0.0, actual_end - start)
 
-        if end is not None:
-            f_str = f"atrim=start={start}:end={actual_end},asetpts=PTS-STARTPTS"
-        else:
-            f_str = f"atrim=start={start},asetpts=PTS-STARTPTS"
+def mix(
+    sources: Iterable[PathLike],
+    destination: PathLike,
+    *,
+    normalize: bool = True,
+    options: ExportOptions = _DEFAULT,
+) -> Path:
+    """
+    Mix inputs from time zero and retain the longest duration.
 
-        return self._clone(new_filter=f_str, new_duration=new_duration)
+    normalize=True scales the mix by the active input weights.
+    normalize=False sums inputs directly and can cause clipping.
+    """
+    if type(normalize) is not bool:
+        raise ValueError("normalize must be a boolean")
 
-    def volume_db(self, db: float) -> AudioTrack:
-        """Adjusts volume by decibels (e.g., +3.5 or -6.0)."""
-        return self._clone(new_filter=f"volume={db}dB")
-
-    def volume_factor(self, factor: float) -> AudioTrack:
-        """Adjusts volume by a linear multiplier (e.g., 0.5 for 50%, 2.0 for 200%)."""
-        if factor < 0:
-            raise ValueError("Volume factor cannot be negative.")
-        return self._clone(new_filter=f"volume={factor}")
-
-    def fade_in(self, duration: float) -> AudioTrack:
-        """Applies a fade-in effect over `duration` seconds from the start."""
-        if duration <= 0:
-            raise ValueError("Fade duration must be positive.")
-        return self._clone(new_filter=f"afade=t=in:st=0:d={duration}")
-
-    def fade_out(self, duration: float) -> AudioTrack:
-        """Applies a fade-out effect over the last `duration` seconds of the track."""
-        if duration <= 0:
-            raise ValueError("Fade duration must be positive.")
-        start_time = max(0.0, self.duration - duration)
-        return self._clone(new_filter=f"afade=t=out:st={start_time:.4f}:d={duration}")
-
-    def speed(self, factor: float) -> AudioTrack:
-        """
-        Changes playback speed without altering pitch using the `atempo` filter.
-        Automatically chains filters if factor is outside [0.5, 2.0].
-        """
-        if factor <= 0:
-            raise ValueError("Speed factor must be strictly positive.")
-
-        # Decompose factor into multiples within [0.5, 2.0] for maximum compatibility
-        tempos = []
-        rem = factor
-        while rem > 2.0:
-            tempos.append(2.0)
-            rem /= 2.0
-        while rem < 0.5:
-            tempos.append(0.5)
-            rem /= 0.5
-        tempos.append(rem)
-
-        filter_chain = ",".join(f"atempo={t:.4f}" for t in tempos)
-        new_duration = self.duration / factor
-        return self._clone(new_filter=filter_chain, new_duration=new_duration)
-
-    def resample(self, sample_rate: int) -> AudioTrack:
-        """Changes the audio sample rate (in Hz, e.g., 44100, 48000)."""
-        if sample_rate <= 0:
-            raise ValueError("Sample rate must be positive.")
-        return self._clone(new_filter=f"aresample={sample_rate}", sample_rate=sample_rate)
-
-    def set_channels(self, channels: int) -> AudioTrack:
-        """Sets the number of audio channels (e.g., 1 for mono, 2 for stereo)."""
-        if channels < 1 or channels > 8:
-            raise ValueError("Channels must be between 1 and 8.")
-        return self._clone(channels=channels)
-
-    # -------------------------------------------------------------------------
-    # Export & Encoding
-    # -------------------------------------------------------------------------
-
-    def export(
-        self,
-        output_path: PathLike,
-        format: Optional[SupportedFormat] = None,
-        bitrate: Optional[str] = None,
-        lossless: bool = False,
-        pcm_bit_depth: Literal[16, 24, 32] = 16,
-    ) -> Path:
-        """
-        Executes the manipulation pipeline and writes the output file.
-
-        :param output_path: Destination file path.
-        :param format: Explicit format ('mp3', 'wav', 'm4a', 'flac', 'opus'). Inferred from extension if omitted.
-        :param bitrate: Target bitrate for lossy formats (e.g., '192k', '128k', '320k').
-        :param lossless: When format is 'm4a', setting lossless=True encodes using ALAC instead of AAC.
-        :param pcm_bit_depth: Bit depth when exporting to 'wav' (16, 24, or 32).
-        """
-        out_path = Path(output_path).resolve()
-        fmt = (format or out_path.suffix.lstrip(".")).lower()
-
-        if fmt not in self.SUPPORTED_FORMATS:
-            raise UnsupportedFormatError(
-                f"Unsupported export format '{fmt}'. Supported: {self.SUPPORTED_FORMATS}"
-            )
-
-        ffmpeg = get_ffmpeg_binary()
-        cmd = [str(ffmpeg), "-hide_banner", "-y"]
-
-        # 1. Add Input(s)
-        for inp in self._inputs:
-            cmd.extend(["-i", str(inp)])
-
-        # 2. Construct Filter Graph
-        if self._is_concat:
-            n = len(self._inputs)
-            in_streams = "".join(f"[{i}:a]" for i in range(n))
-            concat_filter = f"{in_streams}concat=n={n}:v=0:a=1"
-            if self._filters:
-                full_graph = f"{concat_filter}[cat];[cat]{','.join(self._filters)}[outa]"
-            else:
-                full_graph = f"{concat_filter}[outa]"
-            cmd.extend(["-filter_complex", full_graph, "-map", "[outa]"])
-        elif self._filters:
-            cmd.extend(["-af", ",".join(self._filters)])
-
-        # 3. Channel & Sample Rate Overrides
-        if self._target_channels:
-            cmd.extend(["-ac", str(self._target_channels)])
-        if self._target_sample_rate:
-            cmd.extend(["-ar", str(self._target_sample_rate)])
-
-        # 4. Codec & Container Mapping
-        if fmt == "mp3":
-            cmd.extend(["-f", "mp3", "-c:a", "libmp3lame", "-b:a", bitrate or "192k"])
-
-        elif fmt == "wav":
-            pcm_map = {16: "pcm_s16le", 24: "pcm_s24le", 32: "pcm_s32le"}
-            if pcm_bit_depth not in pcm_map:
-                raise ValueError("pcm_bit_depth must be 16, 24, or 32.")
-            cmd.extend(["-f", "wav", "-c:a", pcm_map[pcm_bit_depth]])
-
-        elif fmt == "m4a":
-            if lossless:
-                cmd.extend(["-f", "ipod", "-c:a", "alac"])
-            else:
-                cmd.extend(["-f", "ipod", "-c:a", "aac", "-b:a", bitrate or "192k"])
-
-        elif fmt == "flac":
-            cmd.extend(["-f", "flac", "-c:a", "flac"])
-
-        elif fmt == "opus":
-            # libopus requires specific sample rates (48000, 24000, 16000, 12000, 8000)
-            if not self._target_sample_rate:
-                cmd.extend(["-ar", "48000"])
-            cmd.extend(["-f", "opus", "-c:a", "libopus", "-b:a", bitrate or "128k"])
-
-        # Disable video/data streams explicitly
-        cmd.extend(["-vn", "-dn", "-sn", str(out_path)])
-
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise FFmpegExecutionError(
-                f"Failed to export audio to '{out_path}'.", cmd, proc.stderr
-            )
-
-        return out_path
+    return _combine(
+        sources,
+        destination,
+        options,
+        mixing=True,
+        normalize=normalize,
+    )

@@ -1,19 +1,25 @@
-from .core import AudioMetadata, AudioTrack, get_ffmpeg_binary
-from .exceptions import (
-    BinaryNotFoundError,
-    FFmpegExecutionError,
-    AudioSlimError,
-    UnsupportedFormatError,
+from .core import (
+    AudioError,
+    ExportOptions,
+    concatenate,
+    convert,
+    fade,
+    ffmpeg_path,
+    gain,
+    mix,
+    trim,
 )
 
-__all__ = [
-    "AudioTrack",
-    "AudioMetadata",
-    "get_ffmpeg_binary",
-    "AudioSlimError",
-    "BinaryNotFoundError",
-    "UnsupportedFormatError",
-    "FFmpegExecutionError",
-]
-
 __version__ = "0.1.0"
+
+__all__ = [
+    "AudioError",
+    "ExportOptions",
+    "concatenate",
+    "convert",
+    "fade",
+    "ffmpeg_path",
+    "gain",
+    "mix",
+    "trim",
+]
